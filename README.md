@@ -1,3 +1,5 @@
+Code Snippet
+
 def _precompute_led_mapping(self):
     """Precompute which LEDs correspond to screen positions"""
     c = self.config
