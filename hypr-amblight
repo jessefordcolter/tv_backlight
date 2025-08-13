@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+Hyprland Ambient Lighting Controller for WS2812B LED Strip
+High-performance screen edge color capture for RP2040 via Adalight protocol
+
+Hardware: RP2040 + 270 WS2812B LEDs on /dev/ttyACM0
+Performance: 60 FPS screen capture with minimal CPU usage
+
+# LED Strip Layout (270 LEDs total)
+# 
+#                        TOP (85 LEDs): 
+#                89 ───────────────174
+#                 │                    │
+#    LEFT (49):   │                    │  RIGHT (49)
+#                 │                    │
+#                40 ───────0           │
+#                      269───────223
+#                        
+#                    BOTTOM (85 LEDs long, 86 LEDs total)
+#                         (LED 0 overlaps LED 269)
+"""
+
+import sys
+import time
+import serial
+import numpy as np
+import signal
+import threading
+import queue
+from dataclasses import dataclass
+from typing import Optional, Tuple
+import os
+import subprocess
+import argparse
+import tempfile
+from PIL import Image
+
+# Configuration
+@dataclass
+class Config:
+    # Serial settings
+    serial_port: str = "/dev/ttyACM0"
+    baud_rate: int = 115200
+    
+    # LED settings
+    num_leds: int = 270
+    fps: int = 60
+    brightness: float = 1.0  # 0.0 to 1.0
+    saturation: float = 1.0  # 0.0 to 1.0
+    
+    # Screen capture settings
+    border_size: int = 50  # Pixels from edge to sample
+    sample_step: int = 2   # Sample every N pixels for performance
+    
+    # LED smoothing
+    smoothing_factor: float = 0.15  # Lower = faster response
+    corner_boost: float = 1.3
+    
+    # LED position mapping
+    led_bottom_start: int = 0
+    led_bottom_left: int = 40
+    led_top_left: int = 89
+    led_top_right: int = 174
+    led_bottom_right: int = 223
+    led_bottom_end: int = 269
+
+class AmbiLightController:
+    def __init__(self, config: Config):
+        self.config = config
+        self.running = False
+        self.enabled = True
+        self.serial: Optional[serial.Serial] = None
+        
+        # LED color buffers
+        self.current_colors = np.zeros((config.num_leds, 3), dtype=np.uint8)
+        self.target_colors = np.zeros((config.num_leds, 3), dtype=np.uint8)
+        
+        # Performance optimization
+        self.frame_queue = queue.Queue(maxsize=2)
+        self.capture_thread: Optional[threading.Thread] = None
+        
+        # Precompute LED positions for each screen edge
+        self._precompute_led_mapping()
+        
+        # Get monitor dimensions using Hyprland
+        self.monitor_width, self.monitor_height = self._get_monitor_size()
+        
+    def _get_monitor_size(self) -> Tuple[int, int]:
+        """Get monitor dimensions from Hyprland"""
+        try:
+            result = subprocess.run(
+                ["hyprctl", "monitors", "-j"],
+                capture_output=True,
+                text=True
+            )
+            import json
+            monitors = json.loads(result.stdout)
+            if monitors:
+                return monitors[0]["width"], monitors[0]["height"]
+        except:
+            pass
+        # Fallback dimensions
+        return 1920, 1080
+
+    def _precompute_led_mapping(self):
+        """Precompute which LEDs correspond to screen positions"""
+        c = self.config
+        
+        # Bottom edge - CONTINUOUS mapping with LED 266 at screen center
+        # Physical order: 40->39->...->1->0/269->268->267->266->265->...->223
+        # Note: LEDs 0 and 269 are the same physical LED (overlap)
+        bottom_left_to_start = list(range(40, 0, -1))     # 40,39,38...2,1
+        bottom_overlap_led = [0]                          # LED 0 (same as 269)
+        bottom_center_section = list(range(268, 265, -1)) # 268,267,266
+        bottom_center_to_right = list(range(265, 222, -1)) # 265,264,263...224,223
+        
+        self.bottom_leds = bottom_left_to_start + bottom_overlap_led + bottom_center_section + bottom_center_to_right
+        
+        # Left edge (49 LEDs) - bottom to top
+        self.left_leds = list(range(c.led_bottom_left, c.led_top_left + 1))  # 40 to 89
+        
+        # Top edge (85 LEDs) - left to right
+        self.top_leds = list(range(c.led_top_left, c.led_top_right + 1))  # 89 to 174
+        
+        # Right edge (49 LEDs) - top to bottom  
+        self.right_leds = list(range(c.led_top_right, c.led_bottom_right + 1))  # 174 to 223
+        
+        # Corner LEDs for brightness boost
+        self.corner_leds = set()
+        for corner in [c.led_bottom_left, c.led_top_left, c.led_top_right, c.led_bottom_right]:
+            self.corner_leds.update(range(max(0, corner-1), min(c.num_leds, corner+2)))
+    
+    def connect_serial(self) -> bool:
+        """Connect to RP2040 via serial"""
+        try:
+            self.serial = serial.Serial(
+                self.config.serial_port,
+                self.config.baud_rate,
+                timeout=1
+            )
+            time.sleep(2)  # Wait for connection
+            
+            # Read initial messages
+            while self.serial.in_waiting:
+                line = self.serial.readline().decode('utf-8', errors='ignore').strip()
+                if "Ready" in line:
+                    print(f"Connected: {line}")
+                    return True
+            return True
+        except Exception as e:
+            print(f"Serial connection failed: {e}")
+            return False
+    
+    def capture_screen_edges(self) -> np.ndarray:
+        """Capture colors from screen edges using optimized grim pipeline"""
+        colors = np.zeros((self.config.num_leds, 3), dtype=np.float32)
+        
+        try:
+            # Use grim with pipe to avoid disk I/O - much faster!
+            result = subprocess.run(
+                ["grim", "-t", "ppm", "-"],  # PPM format is faster than PNG
+                capture_output=True,
+                timeout=0.5
+            )
+            
+            if result.returncode != 0:
+                return self.current_colors
+            
+            # Parse PPM format directly from memory
+            data = result.stdout
+            
+            # Find header end (PPM format: P6\nwidth height\n255\n)
+            header_end = 0
+            newline_count = 0
+            for i, byte in enumerate(data):
+                if byte == ord('\n'):
+                    newline_count += 1
+                    if newline_count == 3:
+                        header_end = i + 1
+                        break
+            
+            # Parse dimensions from header
+            header = data[:header_end].decode('ascii')
+            lines = header.strip().split('\n')
+            w, h = map(int, lines[1].split())
+            
+            # Get raw pixel data
+            pixels = np.frombuffer(data[header_end:], dtype=np.uint8)
+            img_array = pixels.reshape((h, w, 3))
+            
+            border = min(self.config.border_size, h//4, w//4)  # Adaptive border
+            step = self.config.sample_step * 2  # Increase step for speed
+            
+            # Optimized sampling - sample fewer pixels but strategically
+            # Sample bottom edge (use stride for speed)
+            bottom_pixels = img_array[-border:, ::step, :]
+            for i, led in enumerate(self.bottom_leds):
+                x_pos = i / len(self.bottom_leds)
+                x_coord = int(x_pos * (w // step))
+                colors[led] = np.mean(bottom_pixels[:, max(0, x_coord-2):x_coord+3, :], axis=(0, 1))
+            
+            # Sample left edge
+            left_pixels = img_array[::step, :border, :]
+            for i, led in enumerate(self.left_leds):
+                y_pos = 1.0 - (i / len(self.left_leds))  # Bottom to top
+                y_coord = int(y_pos * (h // step))
+                colors[led] = np.mean(left_pixels[max(0, y_coord-2):y_coord+3, :, :], axis=(0, 1))
+            
+            # Sample top edge
+            top_pixels = img_array[:border, ::step, :]
+            for i, led in enumerate(self.top_leds):
+                x_pos = i / len(self.top_leds)
+                x_coord = int(x_pos * (w // step))
+                colors[led] = np.mean(top_pixels[:, max(0, x_coord-2):x_coord+3, :], axis=(0, 1))
+            
+            # Sample right edge
+            right_pixels = img_array[::step, w-border:w, :]
+            for i, led in enumerate(self.right_leds):
+                y_pos = (i / len(self.right_leds))  # Top to bottom
+                y_coord = int(y_pos * (h // step))
+                colors[led] = np.mean(right_pixels[max(0, y_coord-2):y_coord+3, :, :], axis=(0, 1))
+            
+        except Exception as e:
+            # Return last known colors on error
+            return self.current_colors
+        
+        # Apply saturation boost
+        if self.config.saturation != 1.0:
+            max_vals = np.max(colors, axis=1, keepdims=True)
+            min_vals = np.min(colors, axis=1, keepdims=True)
+            boost = self.config.saturation
+            colors = min_vals + (colors - min_vals) * boost
+        
+        # Apply corner boost
+        for led in self.corner_leds:
+            colors[led] *= self.config.corner_boost
+        
+        # Apply brightness
+        colors *= self.config.brightness
+        
+        # Clamp and convert to uint8
+        return np.clip(colors, 0, 255).astype(np.uint8)
+    
+    def smooth_colors(self, new_colors: np.ndarray):
+        """Apply temporal smoothing to reduce flicker"""
+        factor = self.config.smoothing_factor
+        self.target_colors = new_colors
+        self.current_colors = (
+            self.current_colors * factor + 
+            self.target_colors * (1 - factor)
+        ).astype(np.uint8)
+    
+    def send_to_leds(self, colors: np.ndarray):
+        """Send color data to RP2040 using Adalight protocol"""
+        if not self.serial or not self.serial.is_open:
+            return
+        
+        #Ensure LED 269 gets the same color as LED 0 (they're in the same location)
+        colors[269] = colors[0]
+        
+        # Adalight protocol header
+        header = bytearray()
+        header.append(ord('A'))
+        header.append(ord('d'))
+        header.append(ord('a'))
+        
+        # LED count (high byte, low byte)
+        led_count = self.config.num_leds
+        header.append((led_count >> 8) & 0xFF)
+        header.append(led_count & 0xFF)
+        
+        # Checksum
+        header.append((header[3] ^ header[4] ^ 0x55))
+        
+        # Prepare color data (RGB format)
+        color_data = colors.flatten().tobytes()
+        
+        # Send data
+        try:
+            self.serial.write(header + color_data)
+        except Exception as e:
+            print(f"Serial write error: {e}")
+    
+    def capture_worker(self):
+        """Worker thread for continuous screen capture"""
+        while self.running:
+            if self.enabled:
+                try:
+                    colors = self.capture_screen_edges()
+                    if not self.frame_queue.full():
+                        self.frame_queue.put(colors, block=False)
+                except Exception as e:
+                    print(f"Capture error: {e}")
+            time.sleep(1.0 / self.config.fps)
+    
+    def run(self):
+        """Main loop"""
+        self.running = True
+        
+        # Start capture thread
+        self.capture_thread = threading.Thread(target=self.capture_worker, daemon=True)
+        self.capture_thread.start()
+        
+        print(f"Ambient lighting running at {self.config.fps} FPS")
+        print("Press Ctrl+C to stop")
+        
+        frame_time = 1.0 / self.config.fps
+        last_frame = time.time()
+        
+        try:
+            while self.running:
+                if self.enabled and not self.frame_queue.empty():
+                    try:
+                        new_colors = self.frame_queue.get(block=False)
+                        self.smooth_colors(new_colors)
+                        self.send_to_leds(self.current_colors)
+                    except queue.Empty:
+                        pass
+                
+                # Maintain target FPS
+                elapsed = time.time() - last_frame
+                if elapsed < frame_time:
+                    time.sleep(frame_time - elapsed)
+                last_frame = time.time()
+                
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Clean shutdown"""
+        self.running = False
+        
+        # Turn off LEDs
+        if self.serial and self.serial.is_open:
+            off_colors = np.zeros((self.config.num_leds, 3), dtype=np.uint8)
+            self.send_to_leds(off_colors)
+            self.serial.close()
+        
+        print("Ambient lighting stopped")
+    
+    def toggle(self):
+        """Toggle LED output on/off"""
+        self.enabled = not self.enabled
+        if not self.enabled:
+            off_colors = np.zeros((self.config.num_leds, 3), dtype=np.uint8)
+            self.send_to_leds(off_colors)
+        print(f"Ambient lighting {'enabled' if self.enabled else 'disabled'}")
+
+def setup_hyprland_autostart():
+    """Add to Hyprland config for autostart"""
+    config_path = os.path.expanduser("~/.config/hypr/hyprland.conf")
+    autostart_line = "exec-once = /usr/local/bin/hypr-ambilight"
+    
+    print(f"\nTo autostart with Hyprland, add this to {config_path}:")
+    print(f"  {autostart_line}")
+    print("\nTo create a toggle keybind, add:")
+    print("  bind = $mainMod, L, exec, pkill -USR1 hypr-ambilight")
+
+def main():
+    parser = argparse.ArgumentParser(description="Hyprland Ambient Lighting Controller")
+    parser.add_argument("--brightness", type=float, default=1.0, help="LED brightness (0.0-1.0)")
+    parser.add_argument("--saturation", type=float, default=1.0, help="Color saturation (0.0-2.0)")
+    parser.add_argument("--fps", type=int, default=60, help="Target FPS (30-144)")
+    parser.add_argument("--smoothing", type=float, default=0.15, help="Smoothing (0.0-1.0, lower=faster)")
+    parser.add_argument("--border", type=int, default=30, help="Screen border size in pixels")
+    parser.add_argument("--setup", action="store_true", help="Show Hyprland setup instructions")
+    
+    args = parser.parse_args()
+    
+    if args.setup:
+        setup_hyprland_autostart()
+        return
+    
+    # Create config with command line arguments
+    config = Config(
+        brightness=max(0.0, min(1.0, args.brightness)),
+        saturation=max(0.0, min(2.0, args.saturation)),
+        fps=max(30, min(144, args.fps)),
+        smoothing_factor=max(0.0, min(1.0, args.smoothing)),
+        border_size=max(10, min(100, args.border))
+    )
+    
+    # Create and run controller
+    controller = AmbiLightController(config)
+    
+    if not controller.connect_serial():
+        print("Failed to connect to RP2040. Check connection and permissions.")
+        sys.exit(1)
+    
+    # Setup signal handler for toggle
+    def toggle_handler(signum, frame):
+        controller.toggle()
+    
+    signal.signal(signal.SIGUSR1, toggle_handler)
+    
+    # Run main loop
+    controller.run()
+
+if __name__ == "__main__":
+    main()
