@@ -4,4 +4,4 @@
 - fastled
 
 ### Code on linux pc
-- hyprambilight
+- hypr-amblight
