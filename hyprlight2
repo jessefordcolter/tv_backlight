@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""
+Hyprland Ambient Lighting Controller for WS2812B LED Strip
+High-performance screen edge color capture for RP2040 via Adalight protocol
+With automatic cinematic mode black bar detection and cropping
+
+Hardware: RP2040 + 270 WS2812B LEDs on /dev/ttyACM0
+Performance: 60 FPS screen capture with minimal CPU usage
+
+# LED Strip Layout (270 LEDs total)
+# 
+#                        TOP (85 LEDs): 
+#                89 ───────────────174
+#                 │                    │
+#    LEFT (49):   │                    │  RIGHT (49)
+#                 │                    │
+#                40 ───────0           │
+#                      269───────223
+#                        
+#                    BOTTOM (85 LEDs long, 86 LEDs total)
+#                         (LED 0 overlaps LED 269)
+"""
+
+import sys
+import time
+import serial
+import numpy as np
+import signal
+import threading
+import queue
+from dataclasses import dataclass
+from typing import Optional, Tuple
+import os
+import subprocess
+import argparse
+import tempfile
+from PIL import Image
+
+# Configuration
+@dataclass
+class Config:
+    # Serial settings
+    serial_port: str = "/dev/ttyACM0"
+    baud_rate: int = 115200
+    
+    # LED settings
+    num_leds: int = 270
+    fps: int = 60
+    brightness: float = 1.0  # 0.0 to 1.0
+    saturation: float = 1.0  # 0.0 to 1.0
+    
+    # Screen capture settings
+    border_size: int = 50  # Pixels from edge to sample
+    sample_step: int = 2   # Sample every N pixels for performance
+    
+    # Cinematic mode settings
+    auto_crop_black_bars: bool = True  # Automatically detect and crop black bars
+    black_bar_threshold: int = 15      # RGB threshold for detecting black bars
+    min_content_height_ratio: float = 0.6  # Minimum content height as ratio of screen
+    force_crop_top: int = 0            # Manual crop from top (pixels)
+    force_crop_bottom: int = 0         # Manual crop from bottom (pixels)
+    crop_detection_samples: int = 10   # Number of lines to sample for black bar detection
+    
+    # LED smoothing
+    smoothing_factor: float = 0.15  # Lower = faster response
+    corner_boost: float = 1.3
+    
+    # LED position mapping
+    led_bottom_start: int = 0
+    led_bottom_left: int = 40
+    led_top_left: int = 89
+    led_top_right: int = 174
+    led_bottom_right: int = 223
+    led_bottom_end: int = 269
+
+class AmbiLightController:
+    def __init__(self, config: Config):
+        self.config = config
+        self.running = False
+        self.enabled = True
+        self.serial: Optional[serial.Serial] = None
+        
+        # LED color buffers
+        self.current_colors = np.zeros((config.num_leds, 3), dtype=np.uint8)
+        self.target_colors = np.zeros((config.num_leds, 3), dtype=np.uint8)
+        
+        # Performance optimization
+        self.frame_queue = queue.Queue(maxsize=2)
+        self.capture_thread: Optional[threading.Thread] = None
+        
+        # Cinematic mode crop cache
+        self.cached_crop = None
+        self.crop_frame_counter = 0
+        self.crop_detection_interval = 30  # Re-detect every 30 frames for efficiency
+        
+        # Precompute LED positions for each screen edge
+        self._precompute_led_mapping()
+        
+        # Get monitor dimensions using Hyprland
+        self.monitor_width, self.monitor_height = self._get_monitor_size()
+        
+        print(f"Monitor: {self.monitor_width}x{self.monitor_height}")
+        if config.auto_crop_black_bars:
+            print("Cinematic mode: Auto-crop black bars enabled")
+        elif config.force_crop_top or config.force_crop_bottom:
+            print(f"Manual crop: Top {config.force_crop_top}px, Bottom {config.force_crop_bottom}px")
+        
+    def _get_monitor_size(self) -> Tuple[int, int]:
+        """Get monitor dimensions from Hyprland"""
+        try:
+            result = subprocess.run(
+                ["hyprctl", "monitors", "-j"],
+                capture_output=True,
+                text=True
+            )
+            import json
+            monitors = json.loads(result.stdout)
+            if monitors:
+                return monitors[0]["width"], monitors[0]["height"]
+        except:
+            pass
+        # Fallback dimensions
+        return 1920, 1080
+
+    def _precompute_led_mapping(self):
+        """Precompute which LEDs correspond to screen positions"""
+        c = self.config
+        
+        # Bottom edge - CONTINUOUS mapping with LED 266 at screen center
+        # Physical order: 40->39->...->1->0/269->268->267->266->265->...->223
+        # Note: LEDs 0 and 269 are the same physical LED (overlap)
+        bottom_left_to_start = list(range(40, 0, -1))     # 40,39,38...2,1
+        bottom_overlap_led = [0]                          # LED 0 (same as 269)
+        bottom_center_section = list(range(268, 265, -1)) # 268,267,266
+        bottom_center_to_right = list(range(265, 222, -1)) # 265,264,263...224,223
+        
+        self.bottom_leds = bottom_left_to_start + bottom_overlap_led + bottom_center_section + bottom_center_to_right
+        
+        # Left edge (49 LEDs) - bottom to top
+        self.left_leds = list(range(c.led_bottom_left, c.led_top_left + 1))  # 40 to 89
+        
+        # Top edge (85 LEDs) - left to right
+        self.top_leds = list(range(c.led_top_left, c.led_top_right + 1))  # 89 to 174
+        
+        # Right edge (49 LEDs) - top to bottom  
+        self.right_leds = list(range(c.led_top_right, c.led_bottom_right + 1))  # 174 to 223
+        
+        # Corner LEDs for brightness boost
+        self.corner_leds = set()
+        for corner in [c.led_bottom_left, c.led_top_left, c.led_top_right, c.led_bottom_right]:
+            self.corner_leds.update(range(max(0, corner-1), min(c.num_leds, corner+2)))
+    
+    def _detect_black_bars(self, img_array: np.ndarray) -> Tuple[int, int]:
+        """
+        Detect black bars at top and bottom of image.
+        Returns (top_crop, bottom_crop) in pixels.
+        Uses cached result for performance.
+        """
+        h, w = img_array.shape[:2]
+        
+        # Use cached crop most of the time for performance
+        self.crop_frame_counter += 1
+        if self.cached_crop is not None and self.crop_frame_counter < self.crop_detection_interval:
+            return self.cached_crop
+        
+        self.crop_frame_counter = 0
+        
+        # Manual crop override
+        if self.config.force_crop_top or self.config.force_crop_bottom:
+            crop = (self.config.force_crop_top, self.config.force_crop_bottom)
+            self.cached_crop = crop
+            return crop
+        
+        if not self.config.auto_crop_black_bars:
+            self.cached_crop = (0, 0)
+            return (0, 0)
+        
+        threshold = self.config.black_bar_threshold
+        samples = self.config.crop_detection_samples
+        
+        # Sample horizontal lines for black bar detection (faster than full image)
+        sample_x_coords = np.linspace(w//4, 3*w//4, samples, dtype=int)
+        
+        top_crop = 0
+        bottom_crop = 0
+        
+        # Detect top black bars - sample from multiple x positions
+        for y in range(0, h//3, 2):  # Check up to 1/3 of image height, step by 2 for speed
+            sample_pixels = img_array[y, sample_x_coords, :]
+            avg_brightness = np.mean(sample_pixels)
+            if avg_brightness > threshold:
+                break
+            top_crop = y
+        
+        # Detect bottom black bars
+        for y in range(h-1, 2*h//3, -2):  # Check up to 1/3 from bottom, step by 2 for speed
+            sample_pixels = img_array[y, sample_x_coords, :]
+            avg_brightness = np.mean(sample_pixels)
+            if avg_brightness > threshold:
+                break
+            bottom_crop = h - 1 - y
+        
+        # Ensure we don't crop too much (safety check)
+        content_height = h - top_crop - bottom_crop
+        min_height = int(h * self.config.min_content_height_ratio)
+        
+        if content_height < min_height:
+            # Reduce crop proportionally
+            excess_crop = min_height - content_height
+            if top_crop > 0 and bottom_crop > 0:
+                # Reduce both proportionally
+                total_crop = top_crop + bottom_crop
+                top_reduction = int(excess_crop * (top_crop / total_crop))
+                bottom_reduction = excess_crop - top_reduction
+                top_crop = max(0, top_crop - top_reduction)
+                bottom_crop = max(0, bottom_crop - bottom_reduction)
+            elif top_crop > 0:
+                top_crop = max(0, top_crop - excess_crop)
+            elif bottom_crop > 0:
+                bottom_crop = max(0, bottom_crop - excess_crop)
+        
+        crop = (top_crop, bottom_crop)
+        self.cached_crop = crop
+        
+        # Log crop changes for debugging
+        if hasattr(self, '_last_logged_crop') and self._last_logged_crop != crop and (top_crop > 10 or bottom_crop > 10):
+            print(f"Cinematic crop: Top {top_crop}px, Bottom {bottom_crop}px (Content: {content_height}px)")
+            self._last_logged_crop = crop
+        
+        return crop
+    
+    def connect_serial(self) -> bool:
+        """Connect to RP2040 via serial"""
+        try:
+            self.serial = serial.Serial(
+                self.config.serial_port,
+                self.config.baud_rate,
+                timeout=1
+            )
+            time.sleep(2)  # Wait for connection
+            
+            # Read initial messages
+            while self.serial.in_waiting:
+                line = self.serial.readline().decode('utf-8', errors='ignore').strip()
+                if "Ready" in line:
+                    print(f"Connected: {line}")
+                    return True
+            return True
+        except Exception as e:
+            print(f"Serial connection failed: {e}")
+            return False
+    
+    def capture_screen_edges(self) -> np.ndarray:
+        """Capture colors from screen edges using optimized grim pipeline with cinematic mode support"""
+        colors = np.zeros((self.config.num_leds, 3), dtype=np.float32)
+        
+        try:
+            # Use grim with pipe to avoid disk I/O - much faster!
+            result = subprocess.run(
+                ["grim", "-t", "ppm", "-"],  # PPM format is faster than PNG
+                capture_output=True,
+                timeout=0.5
+            )
+            
+            if result.returncode != 0:
+                return self.current_colors
+            
+            # Parse PPM format directly from memory
+            data = result.stdout
+            
+            # Find header end (PPM format: P6\nwidth height\n255\n)
+            header_end = 0
+            newline_count = 0
+            for i, byte in enumerate(data):
+                if byte == ord('\n'):
+                    newline_count += 1
+                    if newline_count == 3:
+                        header_end = i + 1
+                        break
+            
+            # Parse dimensions from header
+            header = data[:header_end].decode('ascii')
+            lines = header.strip().split('\n')
+            w, h = map(int, lines[1].split())
+            
+            # Get raw pixel data
+            pixels = np.frombuffer(data[header_end:], dtype=np.uint8)
+            img_array = pixels.reshape((h, w, 3))
+            
+            # Detect and apply cinematic crop
+            top_crop, bottom_crop = self._detect_black_bars(img_array)
+            
+            # Apply crop to get content area
+            if top_crop > 0 or bottom_crop > 0:
+                content_top = top_crop
+                content_bottom = h - bottom_crop if bottom_crop > 0 else h
+                img_array = img_array[content_top:content_bottom, :, :]
+                h = img_array.shape[0]  # Update height after crop
+            
+            border = min(self.config.border_size, h//4, w//4)  # Adaptive border
+            step = self.config.sample_step * 2  # Increase step for speed
+            
+            # Optimized sampling - sample fewer pixels but strategically
+            # Sample bottom edge (use stride for speed)
+            bottom_pixels = img_array[-border:, ::step, :]
+            for i, led in enumerate(self.bottom_leds):
+                x_pos = i / len(self.bottom_leds)
+                x_coord = int(x_pos * (w // step))
+                colors[led] = np.mean(bottom_pixels[:, max(0, x_coord-2):x_coord+3, :], axis=(0, 1))
+            
+            # Sample left edge - map to cropped content area
+            left_pixels = img_array[::step, :border, :]
+            for i, led in enumerate(self.left_leds):
+                y_pos = 1.0 - (i / len(self.left_leds))  # Bottom to top
+                y_coord = int(y_pos * (h // step))
+                colors[led] = np.mean(left_pixels[max(0, y_coord-2):y_coord+3, :, :], axis=(0, 1))
+            
+            # Sample top edge
+            top_pixels = img_array[:border, ::step, :]
+            for i, led in enumerate(self.top_leds):
+                x_pos = i / len(self.top_leds)
+                x_coord = int(x_pos * (w // step))
+                colors[led] = np.mean(top_pixels[:, max(0, x_coord-2):x_coord+3, :], axis=(0, 1))
+            
+            # Sample right edge - map to cropped content area
+            right_pixels = img_array[::step, w-border:w, :]
+            for i, led in enumerate(self.right_leds):
+                y_pos = (i / len(self.right_leds))  # Top to bottom
+                y_coord = int(y_pos * (h // step))
+                colors[led] = np.mean(right_pixels[max(0, y_coord-2):y_coord+3, :, :], axis=(0, 1))
+            
+        except Exception as e:
+            # Return last known colors on error
+            return self.current_colors
+        
+        # Apply saturation boost
+        if self.config.saturation != 1.0:
+            max_vals = np.max(colors, axis=1, keepdims=True)
+            min_vals = np.min(colors, axis=1, keepdims=True)
+            boost = self.config.saturation
+            colors = min_vals + (colors - min_vals) * boost
+        
+        # Apply corner boost
+        for led in self.corner_leds:
+            colors[led] *= self.config.corner_boost
+        
+        # Apply brightness
+        colors *= self.config.brightness
+        
+        # Clamp and convert to uint8
+        return np.clip(colors, 0, 255).astype(np.uint8)
+    
+    def smooth_colors(self, new_colors: np.ndarray):
+        """Apply temporal smoothing to reduce flicker"""
+        factor = self.config.smoothing_factor
+        self.target_colors = new_colors
+        self.current_colors = (
+            self.current_colors * factor + 
+            self.target_colors * (1 - factor)
+        ).astype(np.uint8)
+    
+    def send_to_leds(self, colors: np.ndarray):
+        """Send color data to RP2040 using Adalight protocol"""
+        if not self.serial or not self.serial.is_open:
+            return
+        
+        #Ensure LED 269 gets the same color as LED 0 (they're in the same location)
+        colors[269] = colors[0]
+        
+        # Adalight protocol header
+        header = bytearray()
+        header.append(ord('A'))
+        header.append(ord('d'))
+        header.append(ord('a'))
+        
+        # LED count (high byte, low byte)
+        led_count = self.config.num_leds
+        header.append((led_count >> 8) & 0xFF)
+        header.append(led_count & 0xFF)
+        
+        # Checksum
+        header.append((header[3] ^ header[4] ^ 0x55))
+        
+        # Prepare color data (RGB format)
+        color_data = colors.flatten().tobytes()
+        
+        # Send data
+        try:
+            self.serial.write(header + color_data)
+        except Exception as e:
+            print(f"Serial write error: {e}")
+    
+    def capture_worker(self):
+        """Worker thread for continuous screen capture"""
+        while self.running:
+            if self.enabled:
+                try:
+                    colors = self.capture_screen_edges()
+                    if not self.frame_queue.full():
+                        self.frame_queue.put(colors, block=False)
+                except Exception as e:
+                    print(f"Capture error: {e}")
+            time.sleep(1.0 / self.config.fps)
+    
+    def run(self):
+        """Main loop"""
+        self.running = True
+        
+        # Start capture thread
+        self.capture_thread = threading.Thread(target=self.capture_worker, daemon=True)
+        self.capture_thread.start()
+        
+        print(f"Ambient lighting running at {self.config.fps} FPS")
+        print("Press Ctrl+C to stop")
+        
+        frame_time = 1.0 / self.config.fps
+        last_frame = time.time()
+        
+        try:
+            while self.running:
+                if self.enabled and not self.frame_queue.empty():
+                    try:
+                        new_colors = self.frame_queue.get(block=False)
+                        self.smooth_colors(new_colors)
+                        self.send_to_leds(self.current_colors)
+                    except queue.Empty:
+                        pass
+                
+                # Maintain target FPS
+                elapsed = time.time() - last_frame
+                if elapsed < frame_time:
+                    time.sleep(frame_time - elapsed)
+                last_frame = time.time()
+                
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Clean shutdown"""
+        self.running = False
+        
+        # Turn off LEDs
+        if self.serial and self.serial.is_open:
+            off_colors = np.zeros((self.config.num_leds, 3), dtype=np.uint8)
+            self.send_to_leds(off_colors)
+            self.serial.close()
+        
+        print("Ambient lighting stopped")
+    
+    def toggle(self):
+        """Toggle LED output on/off"""
+        self.enabled = not self.enabled
+        if not self.enabled:
+            off_colors = np.zeros((self.config.num_leds, 3), dtype=np.uint8)
+            self.send_to_leds(off_colors)
+        print(f"Ambient lighting {'enabled' if self.enabled else 'disabled'}")
+
+def setup_hyprland_autostart():
+    """Add to Hyprland config for autostart"""
+    config_path = os.path.expanduser("~/.config/hypr/hyprland.conf")
+    autostart_line = "exec-once = /usr/local/bin/hypr-ambilight"
+    
+    print(f"\nTo autostart with Hyprland, add this to {config_path}:")
+    print(f"  {autostart_line}")
+    print("\nTo create a toggle keybind, add:")
+    print("  bind = $mainMod, L, exec, pkill -USR1 hypr-ambilight")
+
+def main():
+    parser = argparse.ArgumentParser(description="Hyprland Ambient Lighting Controller with Cinematic Mode")
+    parser.add_argument("--brightness", type=float, default=1.0, help="LED brightness (0.0-1.0)")
+    parser.add_argument("--saturation", type=float, default=1.0, help="Color saturation (0.0-2.0)")
+    parser.add_argument("--fps", type=int, default=60, help="Target FPS (30-144)")
+    parser.add_argument("--smoothing", type=float, default=0.15, help="Smoothing (0.0-1.0, lower=faster)")
+    parser.add_argument("--border", type=int, default=30, help="Screen border size in pixels")
+    
+    # Cinematic mode options
+    parser.add_argument("--no-auto-crop", action="store_true", help="Disable automatic black bar detection")
+    parser.add_argument("--crop-threshold", type=int, default=15, help="Black bar detection threshold (0-255)")
+    parser.add_argument("--crop-top", type=int, default=0, help="Manual crop from top (pixels)")
+    parser.add_argument("--crop-bottom", type=int, default=0, help="Manual crop from bottom (pixels)")
+    parser.add_argument("--min-content-ratio", type=float, default=0.6, help="Minimum content height ratio (0.3-1.0)")
+    
+    parser.add_argument("--setup", action="store_true", help="Show Hyprland setup instructions")
+    
+    args = parser.parse_args()
+    
+    if args.setup:
+        setup_hyprland_autostart()
+        return
+    
+    # Create config with command line arguments
+    config = Config(
+        brightness=max(0.0, min(1.0, args.brightness)),
+        saturation=max(0.0, min(2.0, args.saturation)),
+        fps=max(30, min(144, args.fps)),
+        smoothing_factor=max(0.0, min(1.0, args.smoothing)),
+        border_size=max(10, min(100, args.border)),
+        auto_crop_black_bars=not args.no_auto_crop,
+        black_bar_threshold=max(0, min(255, args.crop_threshold)),
+        force_crop_top=max(0, args.crop_top),
+        force_crop_bottom=max(0, args.crop_bottom),
+        min_content_height_ratio=max(0.3, min(1.0, args.min_content_ratio))
+    )
+    
+    # Create and run controller
+    controller = AmbiLightController(config)
+    
+    if not controller.connect_serial():
+        print("Failed to connect to RP2040. Check connection and permissions.")
+        sys.exit(1)
+    
+    # Setup signal handler for toggle
+    def toggle_handler(signum, frame):
+        controller.toggle()
+    
+    signal.signal(signal.SIGUSR1, toggle_handler)
+    
+    # Run main loop
+    controller.run()
+
+if __name__ == "__main__":
+    main()
