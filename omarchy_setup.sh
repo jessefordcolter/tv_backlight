@@ -30,7 +30,7 @@ echo
 
 echo -e "${YELLOW}Step 2: Setting up Python script...${NC}"
 # Copy the Python script to /usr/local/bin
-sudo cp hyprlight2.txt /usr/local/bin/hypr-ambilight
+sudo cp hyprlight2 /usr/local/bin/hypr-ambilight
 sudo chmod +x /usr/local/bin/hypr-ambilight
 
 echo -e "${GREEN}✓ Script installed to /usr/local/bin/hypr-ambilight${NC}"
