@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Ambient Lighting Applet
+Comment=Control ambient TV backlighting
+Exec=/usr/local/bin/ambilight-applet
+Icon=video-display
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
